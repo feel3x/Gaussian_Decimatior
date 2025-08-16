@@ -1,0 +1,7 @@
+numpy==2.3.2
+opencv_python==4.10.0.84
+Pillow==11.3.0
+plyfile==1.1.2
+torch==2.5.1+cu124
+torch_scatter==2.1.2
+tqdm==4.67.0

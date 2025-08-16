@@ -1,3 +1,16 @@
+
+# Gaussian Splat Decimation Tool
+# Author: Felix Hirt
+# License: MIT License (see LICENSE file for details)
+
+# Note:
+# This file contains original code by Felix Hirt, licensed under MIT.
+# Portions of this project may incorporate code from:
+# https://github.com/graphdeco-inria/gaussian-splatting
+# All rights for that software are held by Inria and the Max Planck Institute for Informatics (MPII),
+# and its use is subject to the original licensing terms.
+
+
 import sys
 import argparse
 import scene.gaussian_model as GS
