@@ -8,7 +8,170 @@ from tqdm import tqdm
 import torch_scatter
 
 
-def compute_density_aware_radius_fast(xyz, base_radius, voxel_size=None):
+def decimate(base_radius, gaussian_model, density_aware=False):
+    xyz = gaussian_model._xyz
+    scaling = gaussian_model.get_scaling
+    rotation = gaussian_model.get_rotation  # assumed quaternion-like
+    features_dc = gaussian_model._features_dc
+    features_rest = gaussian_model._features_rest
+    opacity = gaussian_model.get_opacity
+
+    #Density-aware radius assignment
+    if density_aware:
+        print("Computing density-aware radii...")
+        radii = compute_density_aware_radius_fast(xyz, base_radius)
+    else:
+        radii = torch.full((xyz.shape[0],), base_radius, device=xyz.device)
+
+    #luster assignment
+    voxel_idx = torch.floor(xyz / radii.unsqueeze(-1)).long()
+    voxel_keys = (voxel_idx * torch.tensor(
+        [73856093, 19349663, 83492791], device=xyz.device)).sum(1)
+    unique_keys, inverse, counts = torch.unique(voxel_keys, return_inverse=True, return_counts=True)
+
+    print("Merging {} splats into {} clusters...".format(len(xyz), len(unique_keys)))
+
+    #center
+    mean_xyz = torch_scatter.scatter_mean(xyz, inverse, dim=0)
+
+    #Scaling Fix ---
+    dists = torch.norm(xyz - mean_xyz[inverse], dim=1)
+    max_dists, _ = torch_scatter.scatter_max(dists, inverse, dim=0)
+
+    diffs = xyz - mean_xyz[inverse]
+    outer = diffs.unsqueeze(-1) * diffs.unsqueeze(-2)  # (N,3,3)
+
+    cov_sum = torch_scatter.scatter_sum(outer, inverse, dim=0)  # (C,3,3)
+    counts = torch_scatter.scatter_sum(
+        torch.ones(xyz.size(0), device=xyz.device, dtype=torch.float32).unsqueeze(-1).unsqueeze(-1).expand(-1,3,3),
+        inverse, dim=0
+    )
+    cov = cov_sum / counts.clamp_min(1.0)
+
+    #sanitize
+    cov = torch.nan_to_num(cov, nan=0.0, posinf=1e6, neginf=-1e6)
+    cov = cov + torch.eye(3, device=cov.device).unsqueeze(0) * 1e-8
+    #double Sanitize covariance
+    mask_invalid = torch.isnan(cov).any(dim=(1,2)) | torch.isinf(cov).any(dim=(1,2))
+    if mask_invalid.any():
+        cov[mask_invalid] = torch.eye(3, device=cov.device).unsqueeze(0)
+
+    eigvals_list, eigvecs_list = [], []
+    chunk = 20000  # tune for your GPU
+    for i in range(0, cov.size(0), chunk):
+        cov_chunk = cov[i:i+chunk]
+        # sanitize inside chunk
+        cov_chunk = torch.nan_to_num(cov_chunk, nan=0.0, posinf=1e6, neginf=-1e6)
+        cov_chunk += torch.eye(3, device=cov.device).unsqueeze(0) * 1e-8
+        ev, V = torch.linalg.eigh(cov_chunk)
+        eigvals_list.append(ev); eigvecs_list.append(V)
+    eigvals = torch.cat(eigvals_list, 0)
+    eigvecs = torch.cat(eigvecs_list, 0)
+    scale_from_cov = torch.sqrt(torch.clamp(eigvals, min=1e-6))
+
+    #combine conservative estimates
+    new_scaling = torch.maximum(torch_scatter.scatter_mean(scaling, inverse, dim=0),
+                                scale_from_cov.max(dim=1).values.unsqueeze(1))
+    new_scaling = torch.maximum(new_scaling, max_dists.unsqueeze(1) * 0.5)  # inflate a bit
+
+    #normalize input quaternions
+    rotation = rotation / torch.norm(rotation, dim=1, keepdim=True)
+    mean_rot = quaternion_mean_markley(rotation, inverse, len(unique_keys))
+
+
+    #Features weighted by opacity
+    w = opacity.unsqueeze(-1)
+    mean_features_dc = torch_scatter.scatter_sum(features_dc * w, inverse, dim=0) / \
+                       torch_scatter.scatter_sum(w, inverse, dim=0)
+    mean_features_rest = torch_scatter.scatter_sum(features_rest * w, inverse, dim=0) / \
+                         torch_scatter.scatter_sum(w, inverse, dim=0)
+
+    #Opacity fusion 
+    one_minus_alpha = 1 - opacity
+    prod = torch_scatter.scatter_mul(one_minus_alpha, inverse, dim=0)
+    new_opacity = 1 - prod
+
+    #Update Gaussian model
+    print("Updating model...")
+    gaussian_model._xyz = mean_xyz
+    gaussian_model._scaling = gaussian_model.scaling_inverse_activation(new_scaling)
+    gaussian_model._rotation = mean_rot
+    gaussian_model._features_dc = mean_features_dc
+    gaussian_model._features_rest = mean_features_rest
+    gaussian_model._opacity = gaussian_model.inverse_opacity_activation(new_opacity)
+
+    return gaussian_model
+
+def quaternion_mean_markley(quats, cluster_ids, num_clusters, chunk: int = 20000):
+    """
+    Vectorized Markley quaternion averaging.
+    """
+    N = quats.size(0)
+
+    #Outer product q q^T -> (N,4,4)
+    outer = quats.unsqueeze(2) * quats.unsqueeze(1)  # (N,4,4)
+
+    #Sum per cluster
+    M_sum = torch_scatter.scatter_sum(outer, cluster_ids, dim=0, dim_size=num_clusters)  # (C,4,4)
+
+    #Count per cluster
+    ones = torch.ones((N,1,1), device=quats.device, dtype=quats.dtype).expand(-1,4,4)
+    counts = torch_scatter.scatter_sum(ones, cluster_ids, dim=0, dim_size=num_clusters)  # (C,4,4)
+
+    #Normalize
+    M = M_sum / counts.clamp_min(1.0)
+
+    #Sanitize
+    M = torch.nan_to_num(M, nan=0.0, posinf=1e6, neginf=-1e6)
+    M = M + torch.eye(4, device=M.device, dtype=M.dtype).unsqueeze(0) * 1e-8
+    mask_invalid = torch.isnan(M).any(dim=(1,2)) | torch.isinf(M).any(dim=(1,2))
+    if mask_invalid.any():
+        M[mask_invalid] = torch.eye(4, device=M.device, dtype=M.dtype).unsqueeze(0)
+
+    # 6) Chunked eigendecomposition
+    eigvals_list, eigvecs_list = [], []
+    for i in range(0, M.size(0), chunk):
+        M_chunk = M[i:i+chunk]
+        M_chunk = torch.nan_to_num(M_chunk, nan=0.0, posinf=1e6, neginf=-1e6)
+        M_chunk += torch.eye(4, device=M.device, dtype=M.dtype).unsqueeze(0) * 1e-8
+        ev, V = torch.linalg.eigh(M_chunk)  # safe in chunk
+        eigvals_list.append(ev); eigvecs_list.append(V)
+    eigvals = torch.cat(eigvals_list, 0)
+    eigvecs = torch.cat(eigvecs_list, 0)                 # (C,4), (C,4,4)
+
+    max_ids = eigvals.argmax(dim=1)                            # (C,)
+    mean_quats = eigvecs[torch.arange(num_clusters, device=quats.device), :, max_ids]  # (C,4)
+
+    #Normalize outputs
+    mean_quats = mean_quats / (mean_quats.norm(dim=1, keepdim=True) + 1e-12)
+    return mean_quats
+
+def progressive_decimate(gaussian_model, target_count, base_radius=0.01, growth=1.2, max_iter=20):
+    """
+    Progressive decimation of a Gaussian Splatting model until target count is reached.
+    """
+    radius = base_radius
+    xyz = gaussian_model._xyz
+
+    for it in range(max_iter):
+        print(f"\n[Iteration {it+1}] Radius = {radius:.5f}")
+
+        # --- Run smart decimation step ---
+        decimate(radius, gaussian_model)
+
+        new_count = gaussian_model._xyz.shape[0]
+        print(f" → Reduced to {new_count} splats")
+
+        if new_count <= target_count:
+            print("✅ Target reached")
+            break
+
+        # Increase radius for next round
+        radius *= growth
+
+    return gaussian_model
+
+def compute_density_aware_radius_fastOLD(xyz, base_radius, voxel_size=None):
     """Approximate density using voxel occupancy (fixed version)"""
     if voxel_size is None:
         voxel_size = base_radius#/ 2  # Fine grid for density estimation
@@ -33,301 +196,38 @@ def compute_density_aware_radius_fast(xyz, base_radius, voxel_size=None):
     median_density = torch.median(counts.float())
     density_scale = (density_map/median_density)#.clamp(0.3, 1.0)
     print(density_scale)
-    return pow(base_radius,density_scale)
+    return base_radius * density_scale
 
-
-def decimate(base_radius, gaussian_model : GS.GaussianModel, density_aware=False):
-    xyz = gaussian_model._xyz
-    scaling = gaussian_model.get_scaling
-    rotation = gaussian_model.get_rotation
-    features_dc = gaussian_model._features_dc
-    features_rest = gaussian_model._features_rest
-    opacity = gaussian_model.get_opacity
-
-    # # Voxel assignment with spatial hashing
-    # voxel_size = radius
-    # voxel_indices = torch.floor(xyz / voxel_size).long()
+def compute_density_aware_radius_fast(xyz, base_radius, voxel_size=None, show_progress=False):
+    """Approximate density using voxel occupancy (vectorized version)"""
+    if voxel_size is None:
+        voxel_size = base_radius  # fine grid for density estimation
     
-    # # Improved hash with prime multipliers
-    # primes = torch.tensor([73856093, 19349663, 83492791], device=xyz.device)
-    # voxel_keys = (voxel_indices * primes).sum(dim=1)
-
+    # Assign to fine voxels
+    voxel_idx = torch.floor(xyz / voxel_size).long()
     
-    # Compute radii (density-aware or uniform)
-    if density_aware:
-        print("Compute density aware radii...")
-        # First pass with uniform radius to get initial clustering
-        uniform_voxel_idx = torch.floor(xyz / base_radius).long()
-        uniform_keys = (uniform_voxel_idx * torch.tensor([73856093, 19349663, 83492791], 
-                       device=xyz.device)).sum(1)
-        _, inverse = torch.unique(uniform_keys, return_inverse=True)
-        
-        # Now compute density-aware radii within these preliminary clusters
-        radii = compute_density_aware_radius_fast(xyz, base_radius)
-        radii = torch_scatter.scatter_mean(radii, inverse, dim=0)[inverse]
+    # Create unique voxel keys (hash function for uniqueness)
+    voxel_keys = voxel_idx[:, 0] + voxel_idx[:, 1] * 1000 + voxel_idx[:, 2] * 1000000
+    
+    # Count points per voxel
+    unique_keys, counts = torch.unique(voxel_keys, return_counts=True)
+    
+    # Map back counts to original points (vectorized instead of looping)
+    key_to_count = dict(zip(unique_keys.tolist(), counts.tolist()))
+    
+    if show_progress:
+        density_map = torch.zeros_like(voxel_keys, dtype=torch.float32)
+        for i in tqdm(range(len(voxel_keys)), desc="Mapping densities"):
+            density_map[i] = key_to_count[voxel_keys[i].item()]
     else:
-        radii = torch.full((xyz.shape[0],), base_radius, device=xyz.device)
-
-    print(radii.max())
-    print(radii.min())
-    print(radii.mean())
+        # Faster vectorized lookup
+        inv_idx = torch.bucketize(voxel_keys, unique_keys)
+        density_map = counts[inv_idx - 1].float()
     
-    # Final voxel assignment with refined radii
-    voxel_indices = torch.floor(xyz / radii.unsqueeze(-1)).long()
-    voxel_keys = (voxel_indices * torch.tensor([73856093, 19349663, 83492791],
-                 device=xyz.device)).sum(dim=1)
-    
-    # Get final cluster assignments
-    unique_keys, inverse, counts = torch.unique(
-        voxel_keys, return_inverse=True, return_counts=True
-    )
-
-    print("Apply decimation...")
-
-    # Vectorized mean computation
-    mean_xyz = torch_scatter.scatter_mean(xyz, inverse, dim=0)
-    
-    # Compute max distance from centroid
-    dists = torch.norm(xyz - mean_xyz[inverse], dim=1)
-    max_dists, _ = torch_scatter.scatter_max(dists, inverse, dim=0)
-    mean_dists = torch_scatter.scatter_mean(dists, inverse, dim=0)
-    
-    # Rotation handling (sign-corrected mean)
-    first_in_cluster = torch.cat([torch.ones(1, dtype=torch.bool, device=xyz.device), 
-                                inverse[1:] != inverse[:-1]])
-    ref_rot = rotation[first_in_cluster][inverse]
-    sign = torch.sign((rotation * ref_rot).sum(dim=1, keepdim=True))
-    corrected_rot = rotation * sign
-    mean_rot = torch_scatter.scatter_mean(corrected_rot, inverse, dim=0)
-    mean_rot = mean_rot / torch.norm(mean_rot, dim=1, keepdim=True)
-
-    # Feature merging
-    mean_features_dc = torch_scatter.scatter_mean(features_dc, inverse, dim=0)[0]
-    mean_features_rest = torch_scatter.scatter_mean(features_rest, inverse, dim=0)
-    max_opacity = torch_scatter.scatter_max(opacity, inverse, dim=0)[0]    
-    # Scaling adjustment
-    max_scaling, _ = torch_scatter.scatter_max(scaling, inverse, dim=0)
-    # new_scaling = (max_scaling + mean_dists.unsqueeze(1)).clamp(max=0.5)
-    # new_scaling = torch_scatter.scatter_mean(scaling, inverse, dim=0)
-    # new_scaling = max_scaling * max_dists.unsqueeze(1)
-    # new_scaling = new_scaling + max_dists.unsqueeze(1)
-    # Get average scaling of cluster members
-    mean_scaling = torch_scatter.scatter_mean(scaling, inverse, dim=0)
-
-    # Compute bounding sphere radius for the cluster
-    cluster_radius = max_dists.unsqueeze(1)
-
-    # New scaling combines original scale and cluster extent
-    # Using geometric mean for better balance
-    new_scaling = torch.sqrt(mean_scaling * cluster_radius) * 1.5  # Empirical factor
-    new_scaling = torch.maximum(new_scaling, mean_scaling)  # Don't shrink existing scales
-
-    # max_scale = radii * 2  # Prevent over-inflation
-    # new_scaling = torch.minimum(new_scaling, torch.tensor(max_scale, device=new_scaling.device))
-
-    print("Update model...")
-    # Update model
-    gaussian_model._xyz = mean_xyz
-    gaussian_model._scaling = gaussian_model.scaling_inverse_activation(new_scaling)
-    gaussian_model._rotation = mean_rot
-    gaussian_model._features_dc = mean_features_dc
-    gaussian_model._features_rest = mean_features_rest
-    gaussian_model._opacity = gaussian_model.inverse_opacity_activation(max_opacity)
-
-
-#SLOWER decimate even across voxel borders
-def decimateWITHBORDERS(merge_radius, model : GS.GaussianModel, voxel_size = 0.01, max_scale = 100000):
-    """
-    Merge Gaussian points using voxel binning for speed but only merge points
-    within a true radius. Clamp final scale to `max_scale`.
-
-    merge_radius: float, max distance to merge points
-    max_scale: float, clamp merged scale so Gaussians don't blow up
-    """
-    # Extract attributes
-    xyz = model.get_xyz
-    scaling = model.get_scaling
-    rotation = model._rotation
-    features_dc = model._features_dc
-    features_rest = model._features_rest
-    opacity = model._opacity
-
-    device = xyz.device
-
-    #decouple eventually
-    voxel_size = merge_radius
-
-    # Step 1 — assign points to voxels
-    voxel_indices = torch.floor(xyz / voxel_size).to(torch.int64)
-    voxel_keys = voxel_indices[:, 0] * 73856093 ^ voxel_indices[:, 1] * 19349663 ^ voxel_indices[:, 2] * 83492791
-
-    # Step 2 — sort points by voxel key
-    sorted_keys, sort_idx = torch.sort(voxel_keys)
-    xyz = xyz[sort_idx]
-    scaling = scaling[sort_idx]
-    rotation = rotation[sort_idx]
-    features_dc = features_dc[sort_idx]
-    features_rest = features_rest[sort_idx]
-    opacity = opacity[sort_idx]
-
-    # Step 3 — iterate voxel groups and merge within radius
-    new_xyz, new_scaling, new_rotation = [], [], []
-    new_features_dc, new_features_rest, new_opacity, new_tmp_radii = [], [], [], []
-    unique_keys = torch.unique_consecutive(sorted_keys, return_counts=False)
-    progress_bar = tqdm(total=len(unique_keys), desc="Merging Gaussians", unit="voxel")
-    start = 0
-    N = xyz.shape[0]
-    while start < N:
-        # Find end of this voxel group
-        end = start + 1
-        while end < N and sorted_keys[end] == sorted_keys[start]:
-            end += 1
-
-        # Extract points in voxel
-        voxel_points = xyz[start:end]
-
-        # Optional: Also check neighboring voxels
-        # Get neighbor voxel keys (27 including self)
-        vi = voxel_indices[sort_idx[start]]
-        neighbor_offsets = torch.tensor(
-            [[dx, dy, dz] for dx in (-1, 0, 1)
-                          for dy in (-1, 0, 1)
-                          for dz in (-1, 0, 1)],
-            device=device, dtype=torch.int64
-        )
-        neighbor_keys = (vi + neighbor_offsets)[:, 0] * 73856093 ^ \
-                        (vi + neighbor_offsets)[:, 1] * 19349663 ^ \
-                        (vi + neighbor_offsets)[:, 2] * 83492791
-
-        # Mask for points in neighboring voxels
-        mask_neighbors = torch.isin(sorted_keys, neighbor_keys)
-        neighbor_points_idx = torch.where(mask_neighbors)[0]
-
-        # Gather candidate points
-        candidates_xyz = xyz[neighbor_points_idx]
-        candidates_scaling = scaling[neighbor_points_idx]
-        candidates_rotation = rotation[neighbor_points_idx]
-        candidates_features_dc = features_dc[neighbor_points_idx]
-        candidates_features_rest = features_rest[neighbor_points_idx]
-        candidates_opacity = opacity[neighbor_points_idx]
-
-        # Compute distances to the voxel's first point
-        dist = torch.norm(candidates_xyz - voxel_points[0], dim=1)
-        merge_mask = dist <= merge_radius
-
-        cluster_xyz = candidates_xyz[merge_mask]
-        cluster_scaling = candidates_scaling[merge_mask]
-        cluster_rotation = candidates_rotation[merge_mask]
-        cluster_features_dc = candidates_features_dc[merge_mask]
-        cluster_features_rest = candidates_features_rest[merge_mask]
-        cluster_opacity = candidates_opacity[merge_mask]
-
-        # Merge
-        merged_xyz = cluster_xyz.mean(dim=0)
-        extent = (cluster_xyz - merged_xyz).norm(dim=1).max()
-        merged_scale = (cluster_scaling.max(dim=0).values + extent).clamp(max=max_scale)
-        merged_rotation = cluster_rotation.mean(dim=0)
-        merged_features_dc = cluster_features_dc.mean(dim=0, keepdim=True)
-        merged_features_rest = cluster_features_rest.mean(dim=0, keepdim=True)
-        merged_opacity = cluster_opacity.mean(dim=0, keepdim=True)
-
-        # Append
-        new_xyz.append(merged_xyz)
-        new_scaling.append(merged_scale)
-        new_rotation.append(merged_rotation)
-        new_features_dc.append(merged_features_dc)
-        new_features_rest.append(merged_features_rest)
-        new_opacity.append(merged_opacity)
-
-        start = end
-        progress_bar.update(1)
-
-    progress_bar.close()
-
-    # Step 4 — stack and replace
-    model._xyz = torch.stack(new_xyz)
-    model._scaling = model.scaling_inverse_activation(torch.stack(new_scaling))
-    model._rotation = torch.stack(new_rotation)
-    model._features_dc = torch.cat(new_features_dc, dim=0)
-    model._features_rest = torch.cat(new_features_rest, dim=0)
-    model._opacity = torch.cat(new_opacity, dim=0)
-
-
-def decimateOLD(radius, gaussian_model : GS.GaussianModel):
-    xyz = gaussian_model._xyz
-    scaling = gaussian_model._scaling
-    rotation = gaussian_model._rotation
-    features_dc = gaussian_model._features_dc
-    features_rest = gaussian_model._features_rest
-    opacity = gaussian_model._opacity
-
-    #Assign points to voxels
-    voxel_size = radius
-    voxel_indices = torch.floor(xyz / voxel_size).to(torch.int64)
-
-    #Make voxel keys (hash)
-    #primes to reduce collisions
-    voxel_keys = voxel_indices[:,0]*73856093 ^ voxel_indices[:,1]*19349663 ^ voxel_indices[:,2]*83492791
-
-    #Sort by voxel key
-    sorted_keys, sort_idx = torch.sort(voxel_keys)
-    xyz = xyz[sort_idx]
-    scaling = scaling[sort_idx]
-    rotation = rotation[sort_idx]
-    features_dc = features_dc[sort_idx]
-    features_rest = features_rest[sort_idx]
-    opacity = opacity[sort_idx]
-
-    #Merge within each voxel group
-    new_xyz, new_scaling, new_rotation = [], [], []
-    new_features_dc, new_features_rest, new_opacity, new_tmp_radii = [], [], [], []
-    unique_keys, counts = torch.unique_consecutive(sorted_keys, return_counts=True)
-    progress_bar = tqdm(total=len(unique_keys), desc="Merging Gaussians", unit="voxel")
-    start = 0
-    while start < len(xyz):
-        end = start + 1
-        while end < len(xyz) and sorted_keys[end] == sorted_keys[start]:
-            end += 1
-
-        #Points in this voxel
-        cluster_xyz = xyz[start:end]
-        cluster_scaling = scaling[start:end]
-        cluster_rotation = rotation[start:end]
-        cluster_features_dc = features_dc[start:end]
-        cluster_features_rest = features_rest[start:end]
-        cluster_opacity = opacity[start:end]
-
-        merged_xyz = cluster_xyz.mean(dim=0)
-        extent = (cluster_xyz - merged_xyz).norm(dim=1).max()
-        #extent = min((cluster_xyz - merged_xyz).norm(dim=1).max().item(), radius)
-        #merged_scale = (cluster_scaling.max(dim=0).values + extent).clamp(max=radius*2)
-        merged_scale = (cluster_scaling.max(dim=0).values + extent)
-        merged_rotation = cluster_rotation.mean(dim=0)
-        merged_features_dc = cluster_features_dc.mean(dim=0, keepdim=True)
-        merged_features_rest = cluster_features_rest.mean(dim=0, keepdim=True)
-        merged_opacity = cluster_opacity.mean(dim=0, keepdim=True)
-
-        new_xyz.append(merged_xyz)
-        new_scaling.append(merged_scale)
-        new_rotation.append(merged_rotation)
-        new_features_dc.append(merged_features_dc)
-        new_features_rest.append(merged_features_rest)
-        new_opacity.append(merged_opacity)
-
-        start = end
-        progress_bar.update(1)
-
-    progress_bar.close()
-
-    #Stack
-    gaussian_model._xyz = torch.stack(new_xyz)
-    #gaussian_model._scaling = gaussian_model.scaling_inverse_activation(torch.stack(new_scaling))
-    gaussian_model._scaling = torch.stack(new_scaling)
-    gaussian_model._rotation = torch.stack(new_rotation)
-    gaussian_model._features_dc = torch.cat(new_features_dc, dim=0)
-    gaussian_model._features_rest = torch.cat(new_features_rest, dim=0)
-    gaussian_model._opacity = torch.cat(new_opacity, dim=0)
-
+    # Normalize by median
+    median_density = torch.median(counts.float())
+    density_scale = (median_density / density_map).clamp(0.3, 3.0)
+    return base_radius * density_scale
 
 def load_model(path):
     model = GS.GaussianModel(3)
@@ -359,6 +259,12 @@ if __name__ == "__main__":
         help="Path to save the processed model. (Full path with .ply extension)",
         required=True
     )
+    # parser.add_argument(
+    #     "--dense_aware",
+    #     help="Sparse regions are decimated with a higher radius. (SLOWER! Especially for Large Scenes)",
+    #     default=False, 
+    #     action='store_true'
+    # )
 
     args = parser.parse_args()
 
@@ -367,7 +273,8 @@ if __name__ == "__main__":
 
     #start process
     print("Start Decimation...")
-    decimate(float(args.decimate_radius), new_gaussian_model)
+    decimate(float(args.decimate_radius), new_gaussian_model, False)
+    #progressive_decimate(new_gaussian_model, 1000)
 
     #save model
     print("Saving...")
