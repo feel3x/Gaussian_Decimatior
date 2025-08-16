@@ -17,6 +17,7 @@ import scene.gaussian_model as GS
 import torch
 import typing
 from tqdm import tqdm
+import time
     
 import torch_scatter
 
@@ -281,14 +282,19 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    print("Loading Model...")
+    
     #load model
     new_gaussian_model = load_model(args.path_to_model)
-
+    
+    start_time = time.time()
     #start process
     print("Start Decimation...")
     decimate(float(args.decimate_radius), new_gaussian_model, False)
     #progressive_decimate(new_gaussian_model, 1000)
+    print("--- %s seconds ---" % (time.time() - start_time))
 
     #save model
     print("Saving...")
     save_model(args.save_path, new_gaussian_model)
+    
