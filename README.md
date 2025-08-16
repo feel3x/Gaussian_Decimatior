@@ -56,4 +56,6 @@ Contributions, issues, and feature requests are welcome! Feel free to fork the r
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+This project is primarily licensed under the **MIT License**.  
+
+> **Note:** Portions of this project incorporate code from [gaussian-splatting](https://github.com/graphdeco-inria/gaussian-splatting). All ownership rights to that software are held by **Inria** and the **Max Planck Institute for Informatics (MPII)**. Usage of those portions must comply with the original licensing terms of that project.  
