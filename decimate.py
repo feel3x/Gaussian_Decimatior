@@ -11,13 +11,13 @@
 # and its use is subject to the original licensing terms.
 
 
-import sys
+import numpy as np
 import argparse
 import scene.gaussian_model as GS
 import torch
-import typing
 from tqdm import tqdm
 import time
+from plyfile import PlyData, PlyElement
     
 import torch_scatter
 
@@ -160,6 +160,95 @@ def quaternion_mean_markley(quats, cluster_ids, num_clusters, chunk: int = 20000
     mean_quats = mean_quats / (mean_quats.norm(dim=1, keepdim=True) + 1e-12)
     return mean_quats
 
+def get_sh_bands_from_ply(ply_file_path):
+    """
+    Returns the number of spherical harmonics (SH) bands in a Gaussian Splatting .PLY file.
+    
+    Args:
+        ply_file_path (str): Path to the .PLY file containing Gaussian splats
+        
+    Returns:
+        int: Number of SH bands (0, 1, 2, 3, or 4 typically)
+        
+    Raises:
+        FileNotFoundError: If the PLY file doesn't exist
+        ValueError: If the file format is invalid or doesn't contain expected SH data
+    """
+    try:
+        # Load the PLY file
+        plydata = PlyData.read(ply_file_path)
+        
+        # Get the vertex element (where Gaussian splat data is typically stored)
+        if 'vertex' not in plydata:
+            raise ValueError("PLY file does not contain vertex data")
+        
+        vertex = plydata['vertex']
+        
+        # Count SH coefficient properties
+        # SH coefficients are typically named like 'f_dc_0', 'f_dc_1', 'f_dc_2' for DC (band 0)
+        # and 'f_rest_0', 'f_rest_1', ..., 'f_rest_N' for higher order bands
+        
+        sh_properties = []
+        
+        # Handle different PLY file structures
+        if hasattr(vertex, 'dtype') and hasattr(vertex.dtype, 'names') and vertex.dtype.names:
+            property_names = vertex.dtype.names
+        elif hasattr(vertex, 'data') and len(vertex.data) > 0:
+            # Try to get property names from the first data element
+            property_names = vertex.data[0].dtype.names if hasattr(vertex.data[0], 'dtype') else []
+        elif hasattr(vertex, 'properties'):
+            # Alternative: get from properties if available
+            property_names = [prop.name for prop in vertex.properties]
+        else:
+            raise ValueError("Cannot determine property names from PLY vertex data")
+        
+        # Look for SH-related properties
+        for prop_name in property_names:
+            if prop_name.startswith('f_dc_') or prop_name.startswith('f_rest_'):
+                sh_properties.append(prop_name)
+        
+        if not sh_properties:
+            # No SH coefficients found, return 0 bands
+            return 0
+        
+        # Count DC components (band 0)
+        dc_count = len([name for name in sh_properties if name.startswith('f_dc_')])
+        
+        # Count rest components (bands 1+)
+        rest_count = len([name for name in sh_properties if name.startswith('f_rest_')])
+        
+        # Total SH coefficients
+        total_sh_coeffs = dc_count + rest_count
+        
+        # Calculate number of bands
+        # SH coefficients per band: band 0 = 1, band 1 = 3, band 2 = 5, band 3 = 7, etc.
+        # Total coeffs = 1 + 3 + 5 + ... + (2*n+1) for n bands
+        # This equals (n+1)^2 total coefficients for n+1 bands (0 to n)
+        
+        # However, in Gaussian Splatting, we typically have 3 color channels (RGB)
+        # So we need to divide by 3 first
+        if total_sh_coeffs % 3 != 0:
+            raise ValueError(f"Invalid number of SH coefficients: {total_sh_coeffs} (not divisible by 3)")
+        
+        coeffs_per_channel = total_sh_coeffs // 3
+        
+        # Find the number of bands
+        # coeffs_per_channel = (max_band + 1)^2
+        # So max_band = sqrt(coeffs_per_channel) - 1
+        max_band = int(np.sqrt(coeffs_per_channel)) - 1
+        
+        # Verify this is correct
+        expected_coeffs = (max_band + 1) ** 2
+        if expected_coeffs != coeffs_per_channel:
+            raise ValueError(f"Invalid SH coefficient count: {coeffs_per_channel} per channel doesn't match any valid band configuration")
+        
+        return max_band  # Return number of bands (0-indexed max_band + 1)
+        
+    except FileNotFoundError:
+        raise FileNotFoundError(f"PLY file not found: {ply_file_path}")
+    except Exception as e:
+        raise ValueError(f"Error reading PLY file: {str(e)}")
+
 def progressive_decimate(gaussian_model, target_count, base_radius=0.01, growth=1.2, max_iter=20):
     """
     Progressive decimation of a Gaussian Splatting model until target count is reached.
@@ -244,7 +333,9 @@ def compute_density_aware_radius_fast(xyz, base_radius, voxel_size=None, show_pr
     return base_radius * density_scale
 
 def load_model(path):
-    model = GS.GaussianModel(3)
+    amount_sh_bands = get_sh_bands_from_ply(path)
+    print("SH Degree "+ str(amount_sh_bands))
+    model = GS.GaussianModel(amount_sh_bands)
     model.load_ply(path)
     return model
 
