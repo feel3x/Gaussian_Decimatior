@@ -5,20 +5,13 @@
 
 # Note:
 # This file contains original code by Felix Hirt, licensed under MIT.
-# Portions of this project may incorporate code from:
-# https://github.com/graphdeco-inria/gaussian-splatting
-# All rights for that software are held by Inria and the Max Planck Institute for Informatics (MPII),
-# and its use is subject to the original licensing terms.
 
-
-import numpy as np
 import argparse
 import helpers.PointModel as GS
 import torch
 from tqdm import tqdm
 import time
-from plyfile import PlyData, PlyElement
-    
+ 
 import torch_scatter
 
 

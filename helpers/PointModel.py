@@ -1,3 +1,11 @@
+# Gaussian Splat Decimation Tool
+# Author: Felix Hirt
+# License: MIT License (see LICENSE file for details)
+
+# Note:
+# This file contains original code by Felix Hirt, licensed under MIT.
+
+
 import torch
 import numpy as np
 from plyfile import PlyData, PlyElement
@@ -22,8 +30,6 @@ class PointModel:
         def inverse_sigmoid(x):
             return torch.log(x/(1-x))
         self.inverse_opacity_activation = inverse_sigmoid
-
-
 
     @property
     def get_scaling(self):
