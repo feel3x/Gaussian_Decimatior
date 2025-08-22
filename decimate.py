@@ -90,8 +90,11 @@ def decimate(base_radius, gaussian_model, density_aware=False):
     w = opacity.unsqueeze(-1)
     mean_features_dc = torch_scatter.scatter_sum(features_dc * w, inverse, dim=0) / \
                        torch_scatter.scatter_sum(w, inverse, dim=0)
-    mean_features_rest = torch_scatter.scatter_sum(features_rest * w, inverse, dim=0) / \
-                         torch_scatter.scatter_sum(w, inverse, dim=0)
+    if(gaussian_model.max_sh_degree>0):
+        mean_features_rest = torch_scatter.scatter_sum(features_rest * w, inverse, dim=0) / \
+                            torch_scatter.scatter_sum(w, inverse, dim=0)
+    else:
+        mean_features_rest = features_rest
 
     #Opacity fusion 
     one_minus_alpha = 1 - opacity

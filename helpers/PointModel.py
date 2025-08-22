@@ -72,9 +72,14 @@ class PointModel:
         dtype_full = [(attr, "f4") for attr in self.construct_save_list()]
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
 
-        attributes = np.concatenate(
-            (xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1
-        )
+        if(self.max_sh_degree > 0):
+            attributes = np.concatenate(
+                (xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1
+            )
+        else:
+            attributes = np.concatenate(
+                (xyz, normals, f_dc, opacities, scale, rotation), axis=1
+            )
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, "vertex")
         PlyData([el]).write(path)
